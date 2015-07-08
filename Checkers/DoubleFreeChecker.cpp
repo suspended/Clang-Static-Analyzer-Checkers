@@ -200,7 +200,7 @@ DoubleFreeChecker::DoubleFreeChecker()
 {
 	// Initialize the bug types.
 	DoubleFreeBugType.reset(
-		new BugType(this, "Use after free error", "Memory Error"));
+		new BugType(this, "Double free error", "Memory Error"));
 	// Sinks are higher importance bugs as well as calls to assert() or exit(0).
 	//DoubleFreeBugType->setSuppressOnSink(true);
 }

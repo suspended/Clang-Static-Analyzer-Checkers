@@ -76,12 +76,12 @@ namespace {
 	};
 
 	class UseAfterFreeChecker : public Checker<	check::PostCall,
-												check::PreCall 
-												> {
+												check::PreStmt<ReturnStmt>,
+												check::PreCall> 
+	{
 		mutable IdentifierInfo *IIfmalloc, *IIffree;
 
 		std::unique_ptr<BugType> UseAfterFreeBugType;
-		std::unique_ptr<BugType> DoubleFreeBugType;
 
 		void initIdentifierInfo(ASTContext &Ctx) const;
 
@@ -91,18 +91,15 @@ namespace {
 		void reportUseAfterFree(CheckerContext &C, SourceRange Range,
 			SymbolRef Sym) const;
 
-		void reportDoubleFree(CheckerContext &C, SourceRange Range,
-			SymbolRef Sym) const;
-
 		bool symIsFreed(SymbolRef Sym, CheckerContext &C) const;
 
 	public:
 		UseAfterFreeChecker();
 
-		//void checkPreStmt(const ReturnStmt *DS, CheckerContext &C) const;
+		void checkPreStmt(const ReturnStmt *DS, CheckerContext &C) const;
 		
 		void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
-		
+
 		void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
 
 	};
@@ -112,7 +109,6 @@ namespace {
 /// The state of the checker is a map from malloc'd symbols to their
 /// allocation state (in-use or freed). Let's store it in the ProgramState.
 REGISTER_MAP_WITH_PROGRAMSTATE(AllocationMap, SymbolRef, AllocState)
-
 
 namespace {
 	class StopTrackingCallback : public SymbolVisitor {
@@ -129,10 +125,133 @@ namespace {
 	};
 } // end anonymous namespace
 
+bool UseAfterFreeChecker::symIsFreed(SymbolRef Sym, CheckerContext &C) const {
+	assert(Sym);
+	const AllocState *RS = C.getState()->get<AllocationMap>(Sym);
+	return (RS && RS->isFreed());
+}
 
-//	checkPreStmt - Before statement executes, we see if the return value is a
-//	reference to a symbol
+bool UseAfterFreeChecker::checkUseAfterFree(SymbolRef Sym, CheckerContext &C,
+	const Stmt *S) const {
 
+	if (symIsFreed(Sym, C)) {
+		reportUseAfterFree(C, S->getSourceRange(), Sym);
+		return true;
+	}
+
+	return false;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+checkPreStmt - Before returning from a function, we want to see if we are 
+returning a symbol.
+
+If so, check the parameter being passed to see if it is a
+valid symbol.
+
+If valid, check if symbol has been freed and flag use-after-free error since
+it has already been freed.		*/
+void UseAfterFreeChecker::checkPreStmt(const ReturnStmt *S, CheckerContext &C) const {
+	const Expr *E = S->getRetValue();
+	if (!E)
+		return;
+
+	// Check if we are returning a symbol.
+	ProgramStateRef State = C.getState();
+	SVal RetVal = State->getSVal(E, C.getLocationContext());
+	SymbolRef Sym = RetVal.getAsSymbol();
+	if (!Sym)
+		// If we are returning a field of the allocated struct or an array element,
+		// the callee could still free the memory.
+		if (const MemRegion *MR = RetVal.getAsRegion())
+			if (isa<FieldRegion>(MR) || isa<ElementRegion>(MR))
+				if (const SymbolicRegion *BMR =
+					dyn_cast<SymbolicRegion>(MR->getBaseRegion()))
+					Sym = BMR->getSymbol();
+
+	// Check if we are returning freed memory.
+	if (Sym)
+		checkUseAfterFree(Sym, C, E);
+}
+
+/*
+checkPreCall - Before making a call to a function, check if the function
+is free().
+
+If so, check the parameter being passed to see if it is a
+valid symbol.
+
+If valid, check if symbol has been freed and flag double
+free(see if core checker does this)
+
+If the free is supposed to be executed, generate(move to)
+the next transition, in which the value corresponding to
+the symbol in the AllocationMap is updated to Freed */
+void UseAfterFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const
+{
+	initIdentifierInfo(C.getASTContext());
+
+	//if (Call.getCalleeIdentifier() != IIffree)
+	//	return;
+
+	if (Call.getCalleeIdentifier() == IIffree) {
+		// Get the symbolic value corresponding to the variable.
+		SymbolRef Sym = Call.getArgSVal(0).getAsSymbol();
+		if (!Sym)
+			return;
+
+		// Check if the symbol has already been freed.
+		ProgramStateRef State = C.getState();
+		const AllocState *SS = State->get<AllocationMap>(Sym);
+		if (SS && SS->isFreed()) {
+			//reportDoubleFree(C, Call.getSourceRange(), Sym);
+			return;
+		}
+
+		// Generate the next transition, in which the symbol is freed
+		State = State->set<AllocationMap>(Sym, AllocState::getFreed());
+		C.addTransition(State);
+	}
+	else {
+		// Check if the callee of a method is deleted.
+		if (const CXXInstanceCall *CC = dyn_cast<CXXInstanceCall>(&Call)) {
+			SymbolRef Sym = CC->getCXXThisVal().getAsSymbol();
+			if (!Sym || checkUseAfterFree(Sym, C, CC->getCXXThisExpr()))
+				return;
+		}
+
+		// Check arguments for being used after free.
+		for (unsigned I = 0, E = Call.getNumArgs(); I != E; ++I) {
+			SVal ArgSVal = Call.getArgSVal(I);
+			if (ArgSVal.getAs<Loc>()) {
+				SymbolRef Sym = ArgSVal.getAsSymbol();
+				if (!Sym)
+					continue;
+				if (checkUseAfterFree(Sym, C, Call.getArgExpr(I)))
+					return;
+			}
+		}
+	}
+
+	return;
+}
 
 // If we are malloc'ing, we add it to the AllocationMap of allocated symbols
 void UseAfterFreeChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const
@@ -159,60 +278,12 @@ void UseAfterFreeChecker::checkPostCall(const CallEvent &Call, CheckerContext &C
 	return;
 }
 
-/*
-checkPreCall - Before making a call to a function, check if the function
-is free().
-
-If so, check the parameter being passed to see if it is a
-valid symbol.
-
-If valid, check if symbol has been freed and flag double
-free(see if core checker does this)
-
-If the free is supposed to be executed, generate(move to)
-the next transition, in which the value corresponding to
-the symbol in the AllocationMap is updated to Freed */
-void UseAfterFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const
-{
-	initIdentifierInfo(C.getASTContext());
-
-	if (!Call.isGlobalCFunction())
-		return;
-
-	if (Call.getCalleeIdentifier() != IIffree)
-		return;
-
-	if (Call.getNumArgs() != 1)
-		return;
-
-	// Get the symbolic value corresponding to the variable.
-	SymbolRef Sym = Call.getArgSVal(0).getAsSymbol();
-	if (!Sym)
-		return;
-
-	// Check if the symbol has already been freed.
-	ProgramStateRef State = C.getState();
-	const AllocState *SS = State->get<AllocationMap>(Sym);
-	if (SS && SS->isFreed()) {
-		reportDoubleFree(C, Call.getSourceRange(), Sym);
-		return;
-	}
-
-	// Generate the next transition, in which the symbol is freed
-	State = State->set<AllocationMap>(Sym, AllocState::getFreed());
-	C.addTransition(State);
-
-	return;
-}
-
 UseAfterFreeChecker::UseAfterFreeChecker()
 	: IIfmalloc(nullptr), IIffree(nullptr) 
 {
 	// Initialize the bug types.
 	UseAfterFreeBugType.reset(
 		new BugType(this, "Use after free error", "Memory Error"));
-	// Sinks are higher importance bugs as well as calls to assert() or exit(0).
-	//UseAfterFreeBugType->setSuppressOnSink(true);
 }
 
 void UseAfterFreeChecker::reportUseAfterFree(CheckerContext &C, SourceRange Range,
@@ -231,34 +302,11 @@ void UseAfterFreeChecker::reportUseAfterFree(CheckerContext &C, SourceRange Rang
 	C.emitReport(std::move(R));
 }
 
-void UseAfterFreeChecker::reportDoubleFree(CheckerContext &C, SourceRange Range,
-	SymbolRef Sym) const {
-	// We reached a bug, stop exploring the path here by generating a sink.
-	ExplodedNode *ErrNode = C.generateSink();
-	// If we've already reached this node on another path, return.
-	if (!ErrNode)
-		return;
-
-	// Generate the report.
-	auto R = llvm::make_unique<BugReport>(*DoubleFreeBugType,
-		"Double free error", ErrNode);
-	R->addRange(Range);
-	R->markInteresting(Sym);
-	C.emitReport(std::move(R));
-}
-
-bool UseAfterFreeChecker::symIsFreed(SymbolRef Sym, CheckerContext &C) const {
-	assert(Sym);
-	const AllocState *RS = C.getState()->get<AllocationMap>(Sym);
-	return (RS && RS->isFreed());
-}
-
 /* Define the functions we are looking out from by parsing the AST context */
 void UseAfterFreeChecker::initIdentifierInfo(ASTContext &Ctx) const 
 {
 	if (IIfmalloc && IIffree)
 		return;
-
 	IIfmalloc = &Ctx.Idents.get("malloc");
 	IIffree = &Ctx.Idents.get("free");
 }
