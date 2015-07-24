@@ -13,28 +13,30 @@
 //
 //===----------------------------------------------------------------------===//
 
-/*	HIGH LEVEL PSEUDOCODE
+/*  DoubleFreeChecker Visitors
 
 	checkPreCall -	Before making a call to a function, check if the function 
-					is free(). 
+					we are calling is free(). 
 
-					If so, check the parameter being passed to see if it is a 
-					valid symbol.
+					If so, check the parameter being passed to see if there is
+					a valid symbol.
 
 					If valid, check if symbol has been freed before and flag
-					double free.
+					double free if so.
 
-					If the free is supposed to be executed, generate (move to)
-					the next transition, in which the value corresponding to 
-					the symbol in the AllocationMap is updated to Freed.
+					If the symbol is still allocated (not freed before), 
+					generate (move to) to next transition, in which the value 
+					corresponding to the symbol in the AllocationMap is updated
+					to 'Freed'.
 
-	checkPostCall -	After making a call to a function, check if the function
-					is malloc(). Note that calloc is a wrapper for malloc.
+	checkPostCall -	After making a call to a function (to ensure it returned
+					correctly , check if the function is malloc(). Note that 
+					calloc is a wrapper for malloc.
 					
-					If so, get the symbol from the return value.
+					If so, get the malloc'd symbol from the return value.
 
 					Generate the next transition, adding an edge in our
-					AllocationMap, where its value to the key is InUse.
+					AllocationMap, where its value to the key is 'Allocated'.
 */
 
 #include "ClangSACheckers.h"
@@ -50,7 +52,7 @@ namespace {
 
 	struct AllocState {
 	private:
-		enum Kind { Allocated, Freed } K;
+		enum Kind { Allocated, Freed } K;	// 2 states in our state diagram
 		AllocState(Kind InK) { K = InK; };
 
 	public:
@@ -60,19 +62,23 @@ namespace {
 		static AllocState getAllocated() {
 			return AllocState(Allocated);
 		}
+
 		static AllocState getFreed() {
 			return AllocState(Freed);
 		}
+
 		bool operator==(const AllocState &X) const {
 			return K == X.K;
 		}
-		// not sure what this is for; apparently it overrides hash function
+
+		// not clear what this is for; apparently it overrides hash function
+		// by adding the AllocState so that it is used to calculate the hash
 		void Profile(llvm::FoldingSetNodeID &ID) const {
 			ID.AddInteger(K);
 		}
 	};
 
-	class DoubleFreeChecker : public Checker<check::PostCall,check::PreCall> {
+	class DoubleFreeChecker : public Checker<check::PostCall, check::PreCall> {
 		mutable IdentifierInfo *IIfmalloc, *IIffree;
 
 		std::unique_ptr<BugType> DoubleFreeBugType;
@@ -85,24 +91,19 @@ namespace {
 		void reportDoubleFree(CheckerContext &C, SourceRange Range,
 			SymbolRef Sym) const;
 
-		bool symIsFreed(SymbolRef Sym, CheckerContext &C) const;
-
 	public:
 		DoubleFreeChecker();
-
-		//void checkPreStmt(const ReturnStmt *DS, CheckerContext &C) const;
 
 		void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
 
 		void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
 	};
 
-} // end anonymous namespace
+}
 
 /// The state of the checker is a map from malloc'd symbols to their
 /// allocation state (in-use or freed). Let's store it in the ProgramState.
 REGISTER_MAP_WITH_PROGRAMSTATE(AllocationMap, SymbolRef, AllocState)
-
 
 namespace {
 	class StopTrackingCallback : public SymbolVisitor {
@@ -117,14 +118,10 @@ namespace {
 			return true;
 		}
 	};
-} // end anonymous namespace
+}
 
-
-//	checkPreStmt - Before statement executes, we see if the return value is a
-//	reference to a symbol
-
-
-// If we are malloc'ing, we add it to the AllocationMap of allocated symbols
+// If we are malloc'ing, we add it to the AllocationMap of allocated symbols, marking
+// it as Allocated. 
 void DoubleFreeChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const
 {
 	initIdentifierInfo(C.getASTContext());
@@ -138,10 +135,10 @@ void DoubleFreeChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) 
 
 	// Get the symbolic value corresponding to the malloc'd variable
 	SymbolRef Sym = Call.getReturnValue().getAsSymbol();
-	if (!Sym)	// malloc failed; just return
+	if (!Sym)	// malloc somehow failed; just return
 		return;
 
-	// Generate the next transition (current state of var is now allocated).
+	// Generate the next transition (current Symbol state is now Allocated).
 	ProgramStateRef State = C.getState();
 	State = State->set<AllocationMap>(Sym, AllocState::getAllocated());
 	C.addTransition(State);
@@ -149,19 +146,8 @@ void DoubleFreeChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) 
 	return;
 }
 
-/*
-checkPreCall - Before making a call to a function, check if the function
-is free().
-
-If so, check the parameter being passed to see if it is a
-valid symbol.
-
-If valid, check if symbol has been freed and flag double
-free(see if core checker does this)
-
-If the free is supposed to be executed, generate(move to)
-the next transition, in which the value corresponding to
-the symbol in the AllocationMap is updated to Freed */
+// In this visitor, we are checking if we are freeing a symbol for the first
+// time, or freeing it for the second time
 void DoubleFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const
 {
 	initIdentifierInfo(C.getASTContext());
@@ -169,9 +155,11 @@ void DoubleFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) c
 	if (!Call.isGlobalCFunction())
 		return;
 
+	// Hook onto free calls only
 	if (Call.getCalleeIdentifier() != IIffree)
 		return;
 
+	// free() takes in 1 parameter only - pretty much dead code
 	if (Call.getNumArgs() != 1)
 		return;
 
@@ -180,7 +168,8 @@ void DoubleFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) c
 	if (!Sym)
 		return;
 
-	// Check if the symbol has already been freed.
+	// Check if the symbol has already been freed. If we free again
+	// then report DoubleFree error
 	ProgramStateRef State = C.getState();
 	const AllocState *SS = State->get<AllocationMap>(Sym);
 	if (SS && SS->isFreed()) {
@@ -188,6 +177,7 @@ void DoubleFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) c
 		return;
 	}
 
+	// Otherwise, this is our first time freeing it.
 	// Generate the next transition, in which the symbol is freed
 	State = State->set<AllocationMap>(Sym, AllocState::getFreed());
 	C.addTransition(State);
@@ -198,11 +188,9 @@ void DoubleFreeChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) c
 DoubleFreeChecker::DoubleFreeChecker()
 	: IIfmalloc(nullptr), IIffree(nullptr)
 {
-	// Initialize the bug types.
+	// Initialize the DoubleFree bug type.
 	DoubleFreeBugType.reset(
 		new BugType(this, "Double free error", "Memory Error"));
-	// Sinks are higher importance bugs as well as calls to assert() or exit(0).
-	//DoubleFreeBugType->setSuppressOnSink(true);
 }
 
 
@@ -210,7 +198,7 @@ void DoubleFreeChecker::reportDoubleFree(CheckerContext &C, SourceRange Range,
 	SymbolRef Sym) const {
 	// We reached a bug, stop exploring the path here by generating a sink.
 	ExplodedNode *ErrNode = C.generateSink();
-	// If we've already reached this node on another path, return.
+
 	if (!ErrNode)
 		return;
 
@@ -220,12 +208,6 @@ void DoubleFreeChecker::reportDoubleFree(CheckerContext &C, SourceRange Range,
 	R->addRange(Range);
 	R->markInteresting(Sym);
 	C.emitReport(std::move(R));
-}
-
-bool DoubleFreeChecker::symIsFreed(SymbolRef Sym, CheckerContext &C) const {
-	assert(Sym);
-	const AllocState *RS = C.getState()->get<AllocationMap>(Sym);
-	return (RS && RS->isFreed());
 }
 
 /* Define the functions we are looking out from by parsing the AST context */
